@@ -1,0 +1,1176 @@
+---
+title: "48151521VelkoffMarkCaseStudy"
+author: "Mark Velkoff"
+date: "2023-10-16"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE)
+
+library(janitor)
+library(psych)
+library(dplyr)
+library(tidyverse)
+library(tibble)
+library(ggplot2)
+library(stats)
+library(janitor)
+library(rpart)
+library(rpart.plot)
+library(xgboost)
+library(caret)
+library(gridExtra)
+library(gbm)
+library(scales)
+
+#setwd("C:/Users/markv/Documents/Study/Data Analytics - 2023 S2 MQU/Case study assignment")
+setwd("C:/Users/CAF4577/OneDrive - CNA/Documents/Data analytics/Case study assignment")
+CSD <- read.csv('CaseStudyData.csv')
+
+set.seed(10)
+```
+
+
+##(a) Performing simple data exploration analysis
+
+```{r} 
+#Checking basic dimensions of the data
+str(CSD)
+class(CSD)
+head(CSD)
+glimpse(CSD)
+
+#Rename Counts to counts for easier syntax, format gender as factor
+CSD <- CSD %>% rename(counts = Counts) %>%
+  mutate(gender = as.factor(gender))
+str(CSD)
+
+#High-level stats
+summary(CSD)
+#Exposure between 0 and 1 means it represents exposure years
+#No negative claim counts
+#Annually driven distance minimum seems odd - investigate as outlier
+#Age above legal requirement (17)
+#Unclear how to interpret distance (95km in 1 year seems low, 95,000 seems high, 9,500 seems low for a max?)
+
+describe(CSD)
+table(CSD$counts) #only one entry with 5 counts - could be an outlier
+prop.table(table(CSD$gender)) #60:40 split of male vs. female
+table(CSD$carage)
+table(CSD$age)
+table(CSD$distance) #low values for distance don't appear to be outlier entries
+
+
+#Histograms 
+par(mfrow=c(2,3)) 
+hist(CSD$age) 
+hist(CSD$distance)
+hist(CSD$weight)
+hist(CSD$carage) #notice the split hump between the data
+hist(CSD$exposure)
+hist(CSD$counts)
+
+#Check whether counts are poisson distributed before proceeding with GLM and other methods assuming Poisson distribution
+#Performing a chi-square goodness of fit test assuming poisson with lambda equal to sample mean of counts
+lambda <- mean(CSD$counts)
+x <- 0:max(CSD$counts)
+poisson_prob <- dpois(x, lambda)
+
+par(mfrow=c(1,2))
+poisson_curve <- plot(x, poisson_prob, type="h", col="red", main = "Poisson probability density")
+counts_hist <- hist(CSD$counts)
+#shape suggests poisson probabilities assumed in later part of the question are appropriate
+
+
+#Charts to determine outliers
+pairs <- CSD %>%
+  select(-gender) %>%
+  pairs()
+#counts = 5 appears to be an outlier
+
+male_pairs <- CSD %>%
+  filter(gender=="male")%>%
+  select(-gender) %>%
+  pairs()
+#counts = 5 is a male outlier
+
+female_pairs <- CSD %>%
+  filter(gender=="female")%>%
+  select(-gender) %>%
+  pairs()
+#limited volume for claim counts = 4 - consider trimming this for just females
+
+#Investigating counts=5 as an outlier
+CSD %>% filter(counts==5)
+#Seems like a reasonable entry (34 yr old male with high claiming experience) - This also supports the data being Poisson distributed (even the theoretical distribution has an entry at 5 claim counts). Therefore, not going to exclude it even though  1 datapoint is not enough to conclude anything meaningful about the claim frequency for this rating cell - and it could still support analysis of other variables/clustering exercises
+summary(CSD %>% filter(counts==4))
+summary(CSD %>% filter(carage>=30))
+
+data <- CSD
+
+
+
+```
+## Publish dimensions in knitted document
+Summary(CSD)
+CSD %>% filter(counts==5) #This is different now
+
+
+##(b)Estimate claim counts assuming Poisson distribution of errors
+#Still need to select best model
+
+```{r}
+#Clean up data environment
+#rm(list = setdiff(ls(), c("data")))
+
+set.seed(10)
+trainsampleindex<-sample(c(1:nrow(data)),0.9*nrow(data), replace=FALSE)
+train<-data[trainsampleindex,]
+test<-data[-trainsampleindex,]
+
+
+saturated_glm <- glm(counts ~ 
+                       weight + distance + age + carage + gender + 
+                       I(weight^2) + I(distance^2) + I(age^2) + I(carage^2) + 
+                       weight*distance + weight*age + weight*carage + 
+                       distance*age + distance*carage + age*carage + 
+                       offset(log(exposure)), data=train, family=poisson)
+
+
+summary(saturated_glm)
+summary(saturated_glm)$aic
+#AIC = 110663
+summary(saturated_glm)$deviance
+#Residual deviance =  73649 - implies that this model overfits because stepwise selection results in higher deviance but lower AIC
+summary(saturated_glm)$dispersion
+#Dispersion parameter = 1 implying that poisson distribution of errors assumption holds
+
+
+
+#Analyse and pick relevant variables using backward selection
+backwards_glm <- step(saturated_glm, direction = "backward")
+summary(backwards_glm)
+summary(backwards_glm)$aic
+#AIC = 110653
+summary(backwards_glm)$deviance
+#Residual deviance =  73653
+summary(backwards_glm)$dispersion
+#Dispersion parameter = 1 implying that poisson distribution of errors assumption holds
+
+
+#gender appears not to be statistically significant at 95% confidence, whereas all other variables are significant up to 98% confidence. Investigating the impact on predictive power by removing this variable
+
+backwards_glm2 <- glm(counts ~ weight + distance + age + carage + I(carage^2) + weight*distance + age*carage + offset(log(exposure)), data=train, family=poisson)
+summary(backwards_glm2)
+summary(backwards_glm2)$aic
+#AIC = 110654
+summary(backwards_glm2)$deviance
+#Residual deviance =  73656
+summary(backwards_glm2)$dispersion
+#Dispersion parameter = 1 implying that poisson distribution of errors assumption holds
+
+
+test$saturated_fit <- predict(saturated_glm, newdata=test, type="response")
+test$backwards_fit <- predict(backwards_glm, newdata=test, type="response")
+test$backwards2_fit <- predict(backwards_glm2, newdata=test, type="response")
+
+
+#Perform out of sample validation using the deviance statistic - select the model which minimises AIC and has the best generalisability characteristics
+out_sample_error_saturated <- 2*(sum(log((test$counts/test$saturated_fit)^test$counts))-sum(test$counts)+sum(test$saturated_fit))/nrow(test)
+out_sample_error_backwards <- 2*(sum(log((test$counts/test$backwards_fit)^test$counts))-sum(test$counts)+sum(test$backwards_fit))/nrow(test)
+out_sample_error_backwards2 <- 2*(sum(log((test$counts/test$backwards2_fit)^test$counts))-sum(test$counts)+sum(test$backwards2_fit))/nrow(test)
+
+out_sample_error_saturated
+out_sample_error_backwards
+out_sample_error_backwards2
+#backwards glm with no adjustment has the lowest out of sample error on the test dataset. Taking this model to be the optimal model based on its better predictive power, lower residual deviance, and lower AIC
+
+optimal_glm <- backwards_glm
+
+#plotting residual chart
+plot(optimal_glm)
+#Selected GLM does not provide a particularly strong fit to the data. 
+
+#Plotting out of sample residuals
+predicted_values <- predict(optimal_glm, newdata=test, type="response")
+pearson_residuals <- (test$counts - predicted_values)/sqrt(predicted_values)
+plot(predicted_values, pearson_residuals)
+
+
+#check dispersion to ensure poisson assumption is appropriate based on optimal model
+pearson_dispersion <- (sum((train$counts-fitted(optimal_glm))^2/fitted(optimal_glm)))/(nrow(train) - 8 - 1)
+pearson_dispersion
+#dispersion parameter is approximately 1 - therefore poisson distribution is appropriate.
+
+
+#Reporting estimates of lambda
+
+#predict lambda when weight = 2000, distance = 10, age = 30, carage = 5, gender = "male"
+prediction_table <- data.frame(weight=2000, 
+                               distance=10,
+                               age=30,
+                               carage=5,
+                               gender="male",
+                               exposure=1)
+static_prediction_glm <- predict(optimal_glm, newdata=prediction_table, type="response")
+static_prediction_glm
+#This shows that claim intensity (lambda) is 0.01576679 for a risk with characteristics: weight = 2000, distance = 10, age = 30, carage = 5, gender = "male"
+
+
+#plot lambda versus distance when weight = 2000, age = 30, carage = 5, gender = "male"
+xdistance<-seq(min(data$distance),max(data$distance), by=1)
+ydistance<-predict(optimal_glm, list(age=rep(30, length(xdistance)),
+                                gender=rep("male",length(xdistance)),
+                                carage=rep(5,length(xdistance)),
+                                distance=xdistance,
+                                weight=rep(2000,length(xdistance)),
+                                exposure=rep(1,length(xdistance))), type="response")
+
+plot(xdistance,ydistance, xlab="distance",ylab="intensity")
+
+
+data$glm_fit <- predict(optimal_glm, newdata=data, type="response")
+
+
+```
+
+print(static_prediction)
+print(count_plot)
+
+##c) Performing clustering on 'age of driver', and 'age of car'
+
+```{r}
+#Clean up data environment
+#rm(list = setdiff(ls(), c("data", "prediction_table", "static_prediction", "data_to_plot", "prediction_for_plot")))
+
+set.seed(10)
+kmeans_data <- data %>%
+  select(age, carage)
+
+#Prepare withinss_results table and cluster labels
+total_wss <- data.frame(K=numeric(), 
+                        tot_wss=numeric())
+
+
+for (k in 1:10) {
+
+  #Run the clustering
+   kmeans_run <- kmeans(kmeans_data, k, iter.max = 1000, nstart = 1)
+   wss_value <- kmeans_run$tot.withinss
+   cluster_label <- kmeans_run$cluster
+   
+   #Prepare tables to record results
+   total_wss <- rbind(total_wss,
+                      data.frame(K=k, 
+                                 tot_wss=wss_value))
+   kmeans_data <- cbind(kmeans_data,
+                            cluster_label)
+
+}
+
+withinss_plot <- total_wss %>%
+  ggplot(aes(x=K, y=tot_wss)) + 
+  geom_point(color = "red", size = 3) +
+  geom_line() +
+  labs(x="Number of clusters (K)", y="Within clusters sum of squares") +
+  scale_x_continuous(breaks=seq(1:10), minor_breaks = NULL)
+  
+print(withinss_plot)
+
+#Do I need to standardise for exposure? I think no because the question says to ignore Ni
+#fix up y-axis format
+#Looks like Kstar = 3 based on the kink in the curve
+#Do I want to do a more comprehensive approach to determine Kstar? i.e. looking at gap statistics?
+
+kstar <- 3
+kmeans_plot_data <- kmeans_data %>%
+  select(1,2, kstar +2)
+
+kmeans_plot <- kmeans_plot_data %>%
+  ggplot(aes(x=age, y=carage, color=as.factor(cluster_label)))+
+  geom_point()
+
+
+kmeans_plot_data <- kmeans_plot_data %>%
+  rename(age_merge = age,
+         carage_merge = carage)
+kmeans_plot_data2 <- cbind(data, kmeans_plot_data)
+kmeans_plot_data2 <- kmeans_plot_data2 %>%
+  mutate(check1 = age - age_merge,
+         check2 = carage - carage_merge)
+check <- sum(kmeans_plot_data2$check1 + kmeans_plot_data2$check2)
+print(check)
+#All checks are 0 - which is good
+
+kmeans_plot_data2 <- kmeans_plot_data2 %>%
+  select(-c(age_merge, carage_merge, check1, check2))
+
+
+print(kmeans_plot)
+
+hist(data$age)
+hist(data$carage)
+cluster1 <- kmeans_plot_data2 %>%
+  filter(cluster_label ==1)
+hist(cluster1$age)
+hist(cluster1$carage)
+cluster2 <- kmeans_plot_data2 %>%
+  filter(cluster_label ==2)
+hist(cluster2$age)
+hist(cluster2$carage)
+cluster3 <- kmeans_plot_data2 %>%
+  filter(cluster_label ==3)
+hist(cluster3$age)
+hist(cluster3$carage)
+
+
+
+```
+
+##d) Using clustered age/carage to predict GLM
+
+```{r}
+#rm(list = setdiff(ls(), c("data", "prediction_table", "static_prediction", "data_to_plot", "prediction_for_plot", "kmeans_plot_data")))
+
+
+
+set.seed(10)
+trainsampleindex<-sample(c(1:nrow(kmeans_plot_data2)),0.9*nrow(kmeans_plot_data2), replace=FALSE)
+train<-kmeans_plot_data2[trainsampleindex,]
+test<-kmeans_plot_data2[-trainsampleindex,]
+
+saturated_glm_clustered <- glm(counts ~ 
+                                 weight + distance + age + carage + gender + cluster_label +
+                                 I(weight^2) + I(distance^2) + I(age^2) + I(carage^2) + I(cluster_label^2) +
+                                 weight*distance + weight*age + weight*carage + weight*cluster_label +
+                                 distance*age + distance*carage + distance*cluster_label + 
+                                 age*carage + age*cluster_label + 
+                                 carage*cluster_label +
+                                 offset(log(exposure)), data=train, family=poisson)
+
+
+
+summary(saturated_glm_clustered)
+summary(saturated_glm_clustered)$aic
+#AIC = 110059, this is lower than saturated GLM without cluster label
+summary(saturated_glm_clustered)$deviance
+#Residual deviance =  73033 - Also lower than saturated model without cluster label
+summary(saturated_glm_clustered)$dispersion
+#Dispersion parameter = 1 implying that poisson distribution of errors assumption holds
+
+
+
+#Analyse and pick relevant variables using backward selection
+backwards_glm_clustered <- step(saturated_glm_clustered, direction = "backward")
+summary(backwards_glm_clustered)
+summary(backwards_glm_clustered)$aic
+#AIC = 110045, larger improvement from saturated model achieved when using cluster labels
+summary(backwards_glm_clustered)$deviance
+#Residual deviance =  73038
+summary(backwards_glm_clustered)$dispersion
+#Dispersion parameter = 1 implying that poisson distribution of errors assumption holds
+
+
+#gender appears not to be statistically significant at 90% confidence, as does carage at 80% confidence. Investigating the impact on predictive power by removing these variables
+
+#removing carage only
+backwards_glm2_clustered <- glm(counts ~ weight + distance + age + gender + cluster_label + I(age^2) + I(carage^2) + I(cluster_label^2) + weight*distance + age*carage + offset(log(exposure)), data=train, family=poisson)
+summary(backwards_glm2_clustered)
+summary(backwards_glm2_clustered)$aic
+#AIC = 110045
+summary(backwards_glm2_clustered)$deviance
+#Residual deviance =  73038
+summary(backwards_glm2_clustered)$dispersion
+#Dispersion parameter = 1 implying that poisson distribution of errors assumption holds
+
+#removing gender and carage
+backwards_glm3_clustered <- glm(counts ~ weight + distance + age + cluster_label + I(age^2) + I(carage^2) + I(cluster_label^2) + weight*distance + age*carage + offset(log(exposure)), data=train, family=poisson)
+summary(backwards_glm3_clustered)
+summary(backwards_glm3_clustered)$aic
+#AIC = 110045
+summary(backwards_glm3_clustered)$deviance
+#Residual deviance =  73041
+summary(backwards_glm3_clustered)$dispersion
+#Dispersion parameter = 1 implying that poisson distribution of errors assumption holds
+
+
+test$saturated_fit <- predict(saturated_glm_clustered, newdata=test, type="response")
+test$backwards_fit <- predict(backwards_glm_clustered, newdata=test, type="response")
+test$backwards2_fit <- predict(backwards_glm2_clustered, newdata=test, type="response")
+test$backwards3_fit <- predict(backwards_glm3_clustered, newdata=test, type="response")
+
+
+#Perform out of sample validation using the deviance statistic - select the model which minimises AIC and has the best generalisability characteristics
+out_sample_error_saturated <- 2*(sum(log((test$counts/test$saturated_fit)^test$counts))-sum(test$counts)+sum(test$saturated_fit))/nrow(test)
+out_sample_error_backwards <- 2*(sum(log((test$counts/test$backwards_fit)^test$counts))-sum(test$counts)+sum(test$backwards_fit))/nrow(test)
+out_sample_error_backwards2 <- 2*(sum(log((test$counts/test$backwards2_fit)^test$counts))-sum(test$counts)+sum(test$backwards2_fit))/nrow(test)
+out_sample_error_backwards3 <- 2*(sum(log((test$counts/test$backwards3_fit)^test$counts))-sum(test$counts)+sum(test$backwards3_fit))/nrow(test)
+
+out_sample_error_saturated
+out_sample_error_backwards
+out_sample_error_backwards2
+out_sample_error_backwards3
+#backwards glm with no adjustment has the lowest out of sample error on the test dataset. Taking this model to be the optimal model based on its better predictive power, lower residual deviance, and lower AIC
+
+optimal_glm_clustered <- backwards_glm_clustered
+summary(optimal_glm_clustered)
+
+#plotting residual chart
+plot(optimal_glm_clustered)
+#Selected GLM does not provide a particularly strong fit to the data. 
+
+#Plotting out of sample residuals
+predicted_values <- predict(optimal_glm_clustered, newdata=test, type="response")
+pearson_residuals <- (test$counts - predicted_values)/sqrt(predicted_values)
+plot(predicted_values, pearson_residuals)
+
+
+#check dispersion to ensure poisson assumption is appropriate based on optimal model
+pearson_dispersion <- (sum((train$counts-fitted(optimal_glm_clustered))^2/fitted(optimal_glm_clustered)))/(nrow(train) - 11 - 1)
+pearson_dispersion
+#dispersion parameter is approximately 1 - therefore poisson distribution is appropriate.
+
+
+#Reporting estimates of lambda
+
+#predict lambda when weight = 2000, distance = 10, age = 30, carage = 5, gender = "male"
+prediction_table_clustered <- data.frame(weight=2000, 
+                               distance=10,
+                               age=30,
+                               carage=5,
+                               gender="male",
+                               exposure=1,
+                               cluster_label=1)
+static_prediction_glm_clustered <- predict(optimal_glm_clustered, newdata=prediction_table_clustered, type="response")
+static_prediction_glm_clustered
+#This shows that claim intensity (lambda) is 0.03646197 for a risk with characteristics: weight = 2000, distance = 10, age = 30, carage = 5, gender = "male"
+
+
+#plot lambda versus distance when weight = 2000, age = 30, carage = 5, gender = "male"
+xdistance<-seq(min(data$distance),max(data$distance), by=1)
+ydistance<-predict(optimal_glm_clustered, list(age=rep(30, length(xdistance)),
+                                gender=rep("male",length(xdistance)),
+                                carage=rep(5,length(xdistance)),
+                                distance=xdistance,
+                                weight=rep(2000,length(xdistance)),
+                                cluster_label=rep(1,length(xdistance)),
+                                exposure=rep(1,length(xdistance))), type="response")
+
+plot(xdistance,ydistance, xlab="distance",ylab="intensity")
+
+
+data$glm_fit_clustered <- predict(optimal_glm_clustered, newdata=data, type="response")
+
+
+```
+##e) Estimating a Poisson regression tree
+
+``` {r}
+#Clean up workspace
+#rm(list = setdiff(ls(), c("data", "prediction_table", "static_prediction", "data_to_plot", "prediction_for_plot", "prediction_for_plot_clustered", "static_prediction_clustered")))
+
+set.seed(10)
+initial_cp <- 0.0000001
+initial_bucket <- 100
+initial_tree <- rpart(cbind(exposure, counts) ~ weight + distance + carage + age + gender,
+                      data = train, 
+                      method = "poisson",
+                      control = rpart.control(xval=10,
+                                              minbucket=initial_bucket,
+                                              cp=initial_cp,
+                                              ))
+#Using train data because I will compare the impact of difference complexity parameters on the predictive power of my tree. Even though I'm doing 10 fold cross validation to get initial CV error estimates and select initial complexity parameters - I still want to retain a test dataset to select appropriate final complexity parameter for predicting lambda.
+#Minbucket = 100 - this is the stopping rule where if a node has less than 100 observations it will stop building the tree.
+#Almost all individual variables values e.g. (age=20, 21, etc.) have more than 10 obsv, and significant proportion have over 100 therefore choosing 100 in order to create largest possible initial tree whilst respecting computational efficiency i.e. reducing code running time.
+#It is unlikely that having a node for each variable will be retained after pruning so I believe 100 is a good starting balance.
+#Also picking a very low complexity parameter so that the tree doesn't stop building unless there is almost zero improvement in predictive power
+#The intention is to grow the biggest tree possible then prune based on parameters which maximise the reduction in CV error.
+#Using 10-fold cross validation as standard practice
+
+
+#rpart.plot(initial_tree)
+#Large, complex tree like we want
+#If I leave it at 100 this still takes too long to run
+
+#Predict tree to the train and test datasets
+train$fit_initial <- train$exposure*predict(initial_tree)
+test$fit_initial <- test$exposure*predict(initial_tree, newdata=test)
+
+#calculate in sample and our of sample error based on deviance loss function
+in_sample_err_initial <-2*(sum(log((train$counts/train$fit_initial)^train$counts)) - sum(train$counts) + sum(train$fit_initial))/nrow(train)
+out_sample_err_initial <-2*(sum(log((test$counts/test$fit_initial)^test$counts)) - sum(test$counts) + sum(test$fit_initial))/nrow(test)
+
+
+#Plot relative error from cross-validation against cp
+plotcp(initial_tree, minline=TRUE)
+#Relative error drops initially as we add more nodes to the tree but increases if we add too many trees
+#This is reflective of the tree becoming too complicated and overfitting to the data such that the predictive power of the tree is compromised and the relative error of adding another node increases
+#view(initial_tree$cp)
+
+
+
+#Estimating the best cp by:
+#1. Minimum CV error
+#2. 1-SD
+#3. Elbow criteria
+
+#1. Minimum CV error
+min_cp <- initial_tree$cp[which.min(initial_tree$cp[,4]),"CP"]
+min_cp
+
+#2. 1 - SD
+cp_1sd <- min(which(initial_tree$cptable[,4] ==
+                      min(initial_tree$cptable[,4]) + initial_tree$cptable[,5]))
+
+#Want to find the biggest cp where CV error <= CV error + std error of cross validation error
+cp_finder <- function(tree){
+  min.x <- which.min(tree$cp[, 4])
+  for(i in 1:nrow(tree$cp)){
+    if(tree$cp[i, 4] < tree$cp[min.x, 4] + tree$cp[min.x, 5]){
+      return(tree$cp[i, 1])
+    }
+  }
+}
+
+cp_1sd <- cp_finder(initial_tree)
+cp_1sd
+
+
+#3. Elbow criteria
+
+#Plot CV error vs. log(cp)
+plot(log(initial_tree$cp[,1]), initial_tree$cp[, 4],
+          xlab="log(cp)", ylab="CV error",
+     xlim=rev(range(log(initial_tree$cp[,1]))))
+
+#Appears that istar occurs at cp 4th smallest
+#Reducing the complexity parameter anymore will result in more nodes added to the tree with little benefit to reducing cross validation/out of sample prediction error. This is why CV error increases dramatically after a certain point where the complexity of the model is too high, and makes it prone to overfitting the data - reducing its predictive power and increasing the CV error.
+istar <- 4
+
+cp_table <- as.data.frame(initial_tree$cptable) %>%
+  mutate(logcp = log(CP))
+
+#sort in descending order by logcp to match chart
+sorted_cp <- cp_table[order(-cp_table$logcp),]
+elbow_cp <- sorted_cp[istar,1]
+elbow_cp
+
+
+#Run pruned trees and compare accuracy on test data - selecting one with the highest test data accuracy
+#Expecting #1 to overfit, and #2 and #3 are the same.
+#1. Minimum CV error
+min_cp_tree <- prune(initial_tree, 
+                     cp=min_cp)
+rpart.plot(min_cp_tree)
+
+#Predict tree to the train and test datasets
+train$fit_min_cp <- train$exposure*predict(min_cp_tree)
+test$fit_min_cp <- test$exposure*predict(min_cp_tree, newdata=test)
+
+#calculate in sample and our of sample error based on deviance loss function
+in_sample_err_min_cp <-2*(sum(log((train$counts/train$fit_min_cp)^train$counts)) - sum(train$counts) + sum(train$fit_min_cp))/nrow(train)
+out_sample_err_min_cp <-2*(sum(log((test$counts/test$fit_min_cp)^test$counts)) - sum(test$counts) + sum(test$fit_min_cp))/nrow(test)
+
+
+#2. 1 - SD
+cp_1sd_tree <- prune(initial_tree,
+                     cp=cp_1sd)
+rpart.plot(cp_1sd_tree)
+
+
+
+#Predict tree to the train and test datasets
+train$fit_cp_1sd <- train$exposure*predict(cp_1sd_tree)
+test$fit_cp_1sd <- test$exposure*predict(cp_1sd_tree, newdata=test)
+
+#calculate in sample and our of sample error based on deviance loss function
+in_sample_err_cp_1sd <-2*(sum(log((train$counts/train$fit_cp_1sd)^train$counts)) - sum(train$counts) + sum(train$fit_cp_1sd))/nrow(train)
+out_sample_err_cp_1sd <-2*(sum(log((test$counts/test$fit_cp_1sd)^test$counts)) - sum(test$counts) + sum(test$fit_cp_1sd))/nrow(test)
+
+
+#3. Elbow criteria
+elbow_cp_tree <- prune(initial_tree,
+                       cp=elbow_cp)
+rpart.plot(elbow_cp_tree)
+
+
+
+#Predict tree to the train and test datasets
+train$fit_elbow_cp <- train$exposure*predict(elbow_cp_tree)
+test$fit_elbow_cp <- test$exposure*predict(elbow_cp_tree, newdata=test)
+
+#calculate in sample and our of sample error based on deviance loss function
+in_sample_err_elbow_cp <-2*(sum(log((train$counts/train$fit_elbow_cp)^train$counts)) - sum(train$counts) + sum(train$fit_elbow_cp))/nrow(train)
+out_sample_err_elbow_cp <-2*(sum(log((test$counts/test$fit_elbow_cp)^test$counts)) - sum(test$counts) + sum(test$fit_elbow_cp))/nrow(test)
+
+
+#comparing errors
+error_table <- data.frame(
+  model = c("initial", "min_cp", "cp_1sd", "elbow_cp"),
+  CP = c(initial_cp, min_cp, cp_1sd, elbow_cp),
+  in_sample_error = c(in_sample_err_initial, in_sample_err_min_cp, in_sample_err_cp_1sd, in_sample_err_elbow_cp),
+  out_sample_error = c(out_sample_err_initial, out_sample_err_min_cp, out_sample_err_cp_1sd, out_sample_err_elbow_cp)
+) %>%
+  mutate(improvement = percent(out_sample_error/in_sample_error - 1, scale=100))
+#min_cp CP results in fit with lowest out of sample error
+#elbow_cp results in fit with the largest improvement between in sample and out of sample error
+#picking 1-SD CP, I believe this balances the predictive power and additional complexity of all the candidate cp factors such that it mitigates the risk of the model overfitting to the data and the predictions being biased.
+
+
+optimal_tree <- prune(initial_tree, cp=min_cp)
+rpart.plot(optimal_tree)
+tree_prediction_static <- predict(optimal_tree, newdata=prediction_table)
+tree_prediction_static
+
+#plot lambda versus distance when weight = 2000, age = 30, carage = 5, gender = "male"
+xdistance<-seq(min(data$distance),max(data$distance), by=1)
+ydistance<-predict(optimal_tree, newdata=list(age=rep(30, length(xdistance)),
+                                 gender=rep("male",length(xdistance)),
+                                 carage=rep(5,length(xdistance)),
+                                 distance=xdistance,
+                                 weight=rep(2000,length(xdistance)),
+                                 exposure=rep(1,length(xdistance))))
+
+plot(xdistance,ydistance, xlab="distance",ylab="intensity")
+#Selected decision tree doesn't recognize a relationship between annually driven distance and claim frequency - it doesn't use this as part of the decision tree
+#min_cp distinguishes between distance driven less than 20 and more than 20
+#Practically, I like this because this is a hard variable to collect - not particularly accurate, and easy to understate km driven, also no correction for it once a claim happens or at the end of the year so there is incentive to understate from the policyholders perspective
+
+data$tree_fit <- predict(optimal_tree, newdata=data)
+
+```
+##f) Estimating using boosting tree method (with no base model)
+
+```{r}
+#Clean up workspace
+#rm(list = setdiff(ls(), c("data", "prediction_table", "static_prediction", "data_to_plot", "prediction_for_plot", "prediction_for_plot_clustered", "static_prediction_clustered", "optimal tree", "tree_prediction_for_plot")))
+
+#Intention is to include many small trees (i.e. weak learners) to avoid over-fitting
+#Shrinkage factor makes weaker learners weaker - selected via cross-validation
+
+#Need to use CV to estimate 1. Number of boosting steps 2. size of the tree 3. shrinkage paramater
+#1. Number of boosting steps
+#Saw no change after 50 iterations so limiting boosting steps here to speed up the code
+K<- 50
+
+
+#2. Size of the tree 
+#min_cp which was second best decision tree model had 9 layers, optimal model selected only had 4 - so might be able to limit exploration here. But you want weak learners so big deep tree is not appropriate
+#test for 1-10 leaves and plot for fixed shrinkage
+tree_depth <- seq(1, 10, by = 1)
+
+#3. Shrinkage parameter
+shrinkage <- c(0.25, 0.5, 0.75, 1)
+
+
+#split data into train and test datasets for out of sample error analysis
+set.seed(10)
+trainsampleindex<-sample(c(1:nrow(data)),0.9*nrow(data), replace=FALSE)
+train<-data[trainsampleindex,]
+test<-data[-trainsampleindex,]
+
+train$fit <- train$exposure
+test$fit <- test$exposure
+
+#in_sample_error <- vector()
+#out_sample_error <- vector()
+
+results_table <- data.frame(
+  tree_depth = factor(),
+  shrinkage = factor(),
+  iteration_number = integer(),
+  in_sample_error = numeric(),
+  out_sample_error = numeric()
+)
+
+#Loop different tree depths for fixed shrinkage (starting at 1, then for 0.5)
+#Then loop different shrinkage to get whole picture of sensitivity
+#Can consider more if sensitivities are not clear after chart plotting
+  
+#This code takes a long time to run given how many combinations its boosting by all at once  
+#Running the loop without shrinkage to get baseline measures
+for(v in shrinkage){
+  for (t in tree_depth){
+      
+      
+      train$fit <- train$exposure
+      test$fit <- test$exposure
+      
+        for(k in 1:K){
+    
+    
+  boosting.step<-rpart(cbind(fit,counts)~weight+distance+carage+age+gender,
+                       data=train,
+                       method="poisson",
+                       control = rpart.control(maxsurrogate=0,
+                                               xval=1,
+                                               minbucket=10000,
+                                               cp=0.0000001,
+                                               maxdepth=t
+                                               ))
+  #Using higher minbucket than in part e) to avoid overfitting - here I want many weak learners operating sequentially, whereas before I wanted one very strong learner pruned to make a valid predictive model
+
+    train$fit <- train$fit*(predict(boosting.step))^v
+    test$fit <- test$fit*(predict(boosting.step,newdata=test))^v
+
+    in_sample_error<-2*(sum(log((train$counts/train$fit)^train$counts))-sum(train$counts)+sum(train$fit))/nrow(train)
+    out_sample_error<-2*(sum(log((test$counts/test$fit)^test$counts))-sum(test$counts)+sum(test$fit))/nrow(test)
+
+results_table <- results_table %>%
+  rbind(data.frame(
+    shrinkage=v,
+    tree_depth=t,
+    iteration_number=k,
+    in_sample_error = in_sample_error,
+    out_sample_error = out_sample_error
+  ))
+        }
+      }
+    }
+
+
+#Plot errors
+grid_plot_in_sample <- results_table %>%
+  ggplot(aes(x=as.factor(iteration_number), y=in_sample_error, color=as.factor(tree_depth)))+
+  geom_point() +
+  labs(title="In sample errors")+
+  facet_grid(shrinkage~., scales="free")
+print(grid_plot_in_sample)
+
+grid_plot_out_sample <- results_table %>%
+  ggplot(aes(x=as.factor(iteration_number), y=out_sample_error, color=as.factor(tree_depth)))+
+  geom_point() +
+  labs(title="Out of sample errors")+
+  facet_grid(shrinkage~., scales="free")
+print(grid_plot_out_sample)
+#Tree depth makes a significant difference to out of sample errors when boosting fits aren't shrunk
+#If the estimates are not shrunk at each tree (shrinkage = 1), the chart implies that there is explanatory power to be gained from adding additional tree depth i.e. the out of sample error will decrease. This is inappropriate for our purposes because a significant tree depth will make the model prone to over fitting the data and reduce its explanatory power when attempting to predict claim counts.
+#Also, the model requires a lot of trees (>12) to achieve stability in the out of sample errors which also exposes the model to risks of overfitting.
+
+#The depth of each tree has less of an impact on the out of sample errors when boosted trees are shrunk by a bigger factor (i.e. lower shrinkage number in the charts)
+#Benefits of shrinking the fit at each tree are that stability in the errors is achieved with fewer trees (5 trees for 0.5 shrinkage, but >12 for 1 shrinkage)
+#However it appears that shrinking each tree's estimate by too much extends the runway
+
+#Based on the shape of the out of sample error curve, I will shrink the estimates of each tree by a factor 0.5. This appears to strike the best balance between training weak learners with enough predictive power to estimate claim counts and reduce prediction errors, whilst avoiding over fitting the data and losing predictive power by:
+# 1. limiting the number of trees required to achieve stable out of sample error results; and 
+# 2. limiting the depth/detail of each tree
+
+#Zooming in the plot for 0.5 shrinkage to determine tree_depth, and number of trees assumptions in more detail
+half_shrinkage_out_sample <- results_table %>%
+  filter(shrinkage==0.5, tree_depth < 4) %>%
+  ggplot(aes(x=as.factor(iteration_number), y=out_sample_error, color=as.factor(tree_depth)))+
+  geom_point() +
+  labs(title="Out of sample errors")
+print(half_shrinkage_out_sample)
+#Biggest step reduction in out of sample error occurs when tree_depth = 2.
+#This means that increasing the maximum allowable leaves in each tree will not meaningfully improve the quality of the model's prediction, but it creates a greater exposure to the risk of over fitting.
+#Out of sample error appears to stabilise when using 5 trees or more
+
+#Initialising parameters for final Poisson boosting model
+shrinkage <- 0.25
+K <- 50
+tree_depth <- 3
+
+#fit another rpart model - rpart(with best fit based on parms above) i.e. run the loop with the parms I picked
+#Then do rpart.predict?
+
+data$fit <- data$exposure
+
+#Performing poisson boost with parameters selected above
+        for(k in 1:K){
+    
+    
+  optimal_boost_no_base<-rpart(cbind(fit,counts)~weight+distance+carage+age+gender,
+                       data=data,
+                       method="poisson",
+                       control = rpart.control(maxsurrogate=0,
+                                               xval=1,
+                                               minbucket=10000,
+                                               cp=0.0000001,
+                                               maxdepth=tree_depth
+                                               ))
+  #Using higher minbucket than in part e) to avoid overfitting - here I want many weak learners operating sequentially, whereas before I wanted one very strong learner pruned to make a valid predictive model
+
+    data$fit <- data$fit*(predict(optimal_boost_no_base))^shrinkage
+    
+}
+
+
+optimal_boost_no_base <- rpart(data$fit~weight+distance+carage+age+gender,
+      data=data,
+      method="poisson",
+      control=rpart.control(maxsurrogate=0,
+                            minbucket=10000,
+                            cp=0.0000001,
+                            maxdepth=tree_depth
+                            ))
+
+rpart.plot(optimal_boost_no_base)
+
+
+static_prediction_boost_no_base <- rpart.predict(optimal_boost_no_base, newdata = prediction_table)
+static_prediction_boost_no_base
+
+#plot lambda versus distance when weight = 2000, age = 30, carage = 5, gender = "male"
+xdistance<-seq(min(data$distance),max(data$distance), by=1)
+ydistance<-predict(optimal_boost_no_base, newdata=list(age=rep(30, length(xdistance)),
+                                 gender=rep("male",length(xdistance)),
+                                 carage=rep(5,length(xdistance)),
+                                 distance=xdistance,
+                                 weight=rep(2000,length(xdistance)),
+                                 exposure=rep(1,length(xdistance))))
+
+plot(xdistance,ydistance, xlab="distance",ylab="intensity")
+#Poisson boost without a base model also does not recognise a difference in the claiming intensity based on annual distance driven
+
+data$boost_no_base_fit <- rpart.predict(optimal_boost_no_base, newdata=data)
+
+
+```
+
+
+##g) Estimating using boosting tree method (with base model being the fitted model in section b i.e. "best_model")
+
+```{r}
+#Clean up workspace
+#rm(list = setdiff(ls(), c("data", "prediction_table", "static_prediction", "data_to_plot", "prediction_for_plot", "prediction_for_plot_clustered", "static_prediction_clustered", "optimal tree", "tree_prediction_for_plot")))
+
+#Re-calibrating shrinkage, number of trees, and size of tree parameters now that I'm using the base model fitted in part b) (best_model)
+
+#1. Number of boosting steps
+#Saw no change after 50 iterations so limiting boosting steps here to speed up the code
+K<- 50
+
+
+#2. Size of the tree 
+#min_cp which was second best decision tree model had 9 layers, optimal model selected only had 4 - so might be able to limit exploration here. But you want weak learners so big deep tree is not appropriate
+#test for 1-10 leaves and plot for fixed shrinkage
+tree_depth <- seq(1, 10, by = 1)
+
+#3. Shrinkage parameter
+#Appears that there is additional benefit to be gained from greater shrinkage than that considered in part f), therefore expanding the shrinkage vector to consider additional values in the loop.
+shrinkage <- c(0.05, 0.1, 0.18, 0.25, 0.5, 0.75, 1)
+
+
+#split data into train and test datasets for out of sample error analysis
+set.seed(10)
+trainsampleindex<-sample(c(1:nrow(data)),0.9*nrow(data), replace=FALSE)
+train<-data[trainsampleindex,]
+test<-data[-trainsampleindex,]
+
+train$fit <- train$glm_fit
+test$fit <- test$glm_fit
+
+#in_sample_error <- vector()
+#out_sample_error <- vector()
+
+results_table_base <- data.frame(
+  tree_depth = factor(),
+  shrinkage = factor(),
+  iteration_number = integer(),
+  in_sample_error = numeric(),
+  out_sample_error = numeric()
+)
+
+#Loop different tree depths for fixed shrinkage (starting at 1, then for 0.5)
+#Then loop different shrinkage to get whole picture of sensitivity
+#Can consider more if sensitivities are not clear after chart plotting
+  
+#This code takes a long time to run given how many combinations its boosting by all at once  
+#Running the loop without shrinkage to get baseline measures
+for(v in shrinkage){
+  for (t in tree_depth){
+      
+      
+      train$fit <- train$glm_fit
+      test$fit <- test$glm_fit
+      
+        for(k in 1:K){
+    
+    
+  boosting.step<-rpart(cbind(fit,counts)~weight+distance+carage+age+gender,
+                       data=train,
+                       method="poisson",
+                       control = rpart.control(maxsurrogate=0,
+                                               xval=1,
+                                               minbucket=10000,
+                                               cp=0.0000001,
+                                               maxdepth=t
+                                               ))
+
+    train$fit <- train$fit*(predict(boosting.step))^v
+    test$fit <- test$fit*(predict(boosting.step,newdata=test))^v
+
+    in_sample_error<-2*(sum(log((train$counts/train$fit)^train$counts))-sum(train$counts)+sum(train$fit))/nrow(train)
+    out_sample_error<-2*(sum(log((test$counts/test$fit)^test$counts))-sum(test$counts)+sum(test$fit))/nrow(test)
+
+results_table_base <- results_table_base %>%
+  rbind(data.frame(
+    shrinkage=v,
+    tree_depth=t,
+    iteration_number=k,
+    in_sample_error = in_sample_error,
+    out_sample_error = out_sample_error
+  ))
+        }
+      }
+    }
+
+
+#Plot errors
+grid_plot_in_sample <- results_table_base %>%
+  filter(shrinkage %in% c(0.25, 0.5, 0.75, 1)) %>%
+  ggplot(aes(x=as.factor(iteration_number), y=in_sample_error, color=as.factor(tree_depth)))+
+  geom_point() +
+  labs(title="In sample errors")+
+  facet_grid(shrinkage~., scales="free")
+print(grid_plot_in_sample)
+
+grid_plot_out_sample <- results_table_base %>%
+  filter(shrinkage %in% c(0.25, 0.5, 0.75, 1)) %>%
+  ggplot(aes(x=as.factor(iteration_number), y=out_sample_error, color=as.factor(tree_depth)))+
+  geom_point() +
+  labs(title="Out of sample errors")+
+  facet_grid(shrinkage~., scales="free")
+print(grid_plot_out_sample)
+#When using a base model considered and fitted by a GLM process, shrinking the estimates of each tree becomes more important to achieving the stability of out of sample errors, with a smaller number of trees
+#Where the estimates are not shrunk, the out of sample errors do not achieve stability
+#Appears that there is additional benefit gained from tighter shrinkage parameters (i.e. shrinkage <0.25) therefore investigating tigher shrinkage parameters
+
+
+grid_plot_in_sample <- results_table_base %>%
+  filter(shrinkage %in% c(0.1, 0.18, 0.25, 0.5)) %>%
+  ggplot(aes(x=as.factor(iteration_number), y=in_sample_error, color=as.factor(tree_depth)))+
+  geom_point() +
+  labs(title="In sample errors")+
+  facet_grid(shrinkage~., scales="free")
+print(grid_plot_in_sample)
+
+grid_plot_out_sample <- results_table_base %>%
+  filter(shrinkage %in% c(0.1, 0.18, 0.25, 0.5)) %>%
+  ggplot(aes(x=as.factor(iteration_number), y=out_sample_error, color=as.factor(tree_depth)))+
+  geom_point() +
+  labs(title="Out of sample errors")+
+  facet_grid(shrinkage~., scales="free")
+print(grid_plot_out_sample)
+#Additional tree depth is required to utilise the predictive power of the base model when learning - however this exposes the model to over fitting if the learners are not weak enough
+#Hence if a greater tree depth is selected, tigheter shrinkage of each tree's parameters should be performed
+#More noise in out of sample error as we increase the number of trees but keep shrinkage at 0.5
+#Too many trees are required to achieve stability in out of sample error when shrinkage is below 0.25 - this exposes the model to risks of over fitting and is not desirable
+#increasing beyond maximum tree depth of 4 does not provide an appreciable improvement in out of sample error. Adding additional leaves to each tree exposes the model to the risk of over fitting so I have decided to retain a maximum of 4 levels per tree
+#Minimum trees required to reach the lowest achievable out of sample error is 25 trees given the selected shrinkage (0.25), and maximum tree depth (4)
+#These parameters imply additional complexity in the trees but this is required 
+#The performance 
+#a-priori interactions so tree depth needs to be deeper
+
+#25 trees at 4 tree_depth, 0.25 shrinkage
+#Initialising parameters for final Poisson boosting model
+shrinkage_base <- 0.25
+K_base <- 15
+tree_depth_base <- 4
+
+
+data$fit <- data$glm_fit
+
+#Performing poisson boost with parameters selected above
+        for(k in 1:K_base){
+    
+    
+  optimal_boost_base<-rpart(cbind(fit,counts)~weight+distance+carage+age+gender,
+                       data=data,
+                       method="poisson",
+                       control = rpart.control(maxsurrogate=0,
+                                               xval=1,
+                                               minbucket=10000,
+                                               cp=0.0000001,
+                                               maxdepth=tree_depth_base
+                                               ))
+  #Using higher minbucket than in part e) to avoid overfitting - here I want many weak learners operating sequentially, whereas before I wanted one very strong learner pruned to make a valid predictive model
+
+    data$fit <- data$fit*(predict(optimal_boost_base))^shrinkage_base
+    
+}
+
+optimal_boost_base <- rpart(fit~weight+distance+carage+age+gender,
+      data=data,
+      method="poisson",
+      control=rpart.control(maxsurrogate=0,
+                            minbucket=10000,
+                            cp=0.0000001,
+                            maxdepth=tree_depth_base
+                            ))
+
+rpart.plot(optimal_boost_base)
+
+
+
+static_prediction_boost_base <- rpart.predict(optimal_boost_base, newdata = prediction_table)
+static_prediction_boost_base
+
+#plot lambda versus distance when weight = 2000, age = 30, carage = 5, gender = "male"
+xdistance<-seq(min(data$distance),max(data$distance), by=1)
+ydistance<-predict(optimal_boost_base, newdata=list(age=rep(30, length(xdistance)),
+                                 gender=rep("male",length(xdistance)),
+                                 carage=rep(5,length(xdistance)),
+                                 distance=xdistance,
+                                 weight=rep(2000,length(xdistance)),
+                                 exposure=rep(1,length(xdistance))))
+
+plot(xdistance,ydistance, xlab="distance",ylab="intensity")
+#Poisson boost without a base model also does not recognise a difference in the claiming intensity based on annual distance driven
+
+data$boost_base_fit <- rpart.predict(optimal_boost_base, newdata=data)
+
+```
+
+
+##h) Comparing fitted models from b), d), e), f), g) and using 10-fold cross validation error to select the best model
+
+```{r}
+
+#organise data randomly to allow for sampling to perform k-fold cross-validation on each model
+set.seed(10)
+data1 <- kmeans_plot_data2 #use this dataset because it already includes cluster_label
+data1$random_indicator <- runif(nrow(data1))
+data1 <- data1[order(data1$random_indicator),]
+
+
+K <- 10
+data1$CV <- rep(1:K, length = nrow(data1))
+
+cv_error_glm <- c()
+for (k1 in 1:K){
+  data1_train <- data1[which(data1$CV!= k1),]
+    
+  optimal_model <- optimal_glm
+
+  data1_test <- data1[which (data1$CV == k1),]
+  
+  data1_test$fit <- predict(optimal_model , newdata=data1_test, type ="response")
+  
+  cv_error_glm[k1] <- 2*mean(data1_test$fit - data1_test$counts - 
+                  log((data1_test$fit/data1_test$counts)^data1_test$counts))
+}
+
+avg_cv_error_glm <- sum(cv_error_glm)/K
+                      
+avg_cv_error_glm
+
+
+cv_error_glm_clustered <- c()
+for (k1 in 1:K){
+  data1_train <- data1[which(data1$CV!= k1),]
+    
+  optimal_model <- optimal_glm_clustered
+
+  data1_test <- data1[which (data1$CV == k1),]
+  
+  data1_test$fit <- predict(optimal_model , newdata=data1_test, type ="response")
+  
+  cv_error_glm_clustered[k1] <- 2*mean(data1_test$fit - data1_test$counts - 
+                  log((data1_test$fit/data1_test$counts)^data1_test$counts))
+}
+
+avg_cv_error_glm_clustered <- sum(cv_error_glm_clustered)/K
+                      
+avg_cv_error_glm_clustered
+
+
+cv_error_tree <- c()
+for (k1 in 1:K){
+  data1_train <- data1[which(data1$CV!= k1),]
+    
+  optimal_model <- optimal_tree
+
+  data1_test <- data1[which (data1$CV == k1),]
+  
+  data1_test$fit <- predict(optimal_model , newdata=data1_test)
+  
+  cv_error_tree[k1] <- 2*mean(data1_test$fit - data1_test$counts - 
+                  log((data1_test$fit/data1_test$counts)^data1_test$counts))
+}
+
+avg_cv_error_tree <- sum(cv_error_tree)/K
+                      
+avg_cv_error_tree
+
+
+
+cv_error_boost_no_base <- c()
+for (k1 in 1:K){
+  data1_train <- data1[which(data1$CV!= k1),]
+    
+  optimal_model <- optimal_boost_no_base
+
+  data1_test <- data1[which (data1$CV == k1),]
+  
+  data1_test$fit <- predict(optimal_model , newdata=data1_test)
+  
+  cv_error_boost_no_base[k1] <- 2*mean(data1_test$fit - data1_test$counts - 
+                  log((data1_test$fit/data1_test$counts)^data1_test$counts))
+}
+
+avg_cv_error_boost_no_base <- sum(cv_error_boost_no_base)/K
+                    
+avg_cv_error_boost_no_base
+
+
+
+cv_error_boost_base <- c()
+for (k1 in 1:K){
+  data1_train <- data1[which(data1$CV!= k1),]
+    
+  optimal_model <- optimal_boost_base
+
+  data1_test <- data1[which (data1$CV == k1),]
+  
+  data1_test$fit <- predict(optimal_model , newdata=data1_test)
+  
+  cv_error_boost_base[k1] <- 2*mean(data1_test$fit - data1_test$counts - 
+                  log((data1_test$fit/data1_test$counts)^data1_test$counts))
+}
+
+avg_cv_error_boost_base <- sum(cv_error_boost_base)/K
+                    
+avg_cv_error_boost_base
+
+
+CV_results <- data.frame(
+  K_fold = c(seq(1,10, by=1), "Average"),
+  GLM = c(cv_error_glm, avg_cv_error_glm),
+  GLM_clustered = c(cv_error_glm_clustered, avg_cv_error_glm_clustered),
+  Poisson_tree = c(cv_error_tree, avg_cv_error_tree),
+  Poisson_tree_boost_no_base = c(cv_error_boost_no_base, avg_cv_error_boost_no_base),
+  Poisson_tree_boost_GLM_base = c(cv_error_boost_base, avg_cv_error_boost_base)
+) #%>%
+#  mutate(
+#    GLM = percent(GLM, accuracy = 0.01),
+#    GLM_clustered = percent(GLM_clustered, accuracy = 0.01),
+#    Poisson_tree = percent(Poisson_tree, accuracy = 0.01),
+#    Poisson_tree_boost_no_base = percent(Poisson_tree_boost_no_base, accuracy = 0.01),
+#    Poisson_tree_boost_GLM_base = percent(Poisson_tree_boost_GLM_base, accuracy = 0.01)
+#  )
+
+CV_results$K_fold <- factor(CV_results$K_fold, levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "Average"))
+CV_results <- CV_results %>%
+  gather(key="model", value="CV_error", -K_fold)
+
+
+
+CV_results_line <- CV_results %>%
+  filter(K_fold != "Average") %>%
+  ggplot(aes(x=as.factor(K_fold), y=CV_error, color=model, group = model))+
+  geom_line()
+print(CV_results_line)  
+          
+CV_results_bar <- CV_results %>%
+   filter(K_fold == "Average") %>%
+   ggplot(aes(x=model, y=CV_error, fill=model))+
+   geom_col()
+ print(CV_results_bar)
+              
+
+
+```
